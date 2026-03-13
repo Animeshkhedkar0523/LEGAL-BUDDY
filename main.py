@@ -30,7 +30,12 @@ RAG_PATH = BASE_DIR / "civil_law(RAG).json"
 LAWYER_PATH = BASE_DIR / "lawyer(RAG).json"
 RISK_PATH = BASE_DIR / "legal_contract_clauses.csv"
 
-GROQ_MODEL = "gemma2-9b-it"
+DEFAULT_GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_MODEL_CANDIDATES = [
+    os.getenv("GROQ_MODEL", "").strip(),
+    DEFAULT_GROQ_MODEL,
+    "llama-3.3-70b-versatile",
+]
 EMBEDDING_MODEL = "gemini-embedding-001"
 PDF_CHUNK_SIZE = 4000
 PDF_CHUNK_OVERLAP = 400
@@ -169,10 +174,10 @@ def load_risk_data() -> pd.DataFrame:
 
 
 @st.cache_resource(show_spinner=False)
-def build_llm() -> ChatGroq:
+def build_llm(model_name: str) -> ChatGroq:
     if not GROQ_API_KEY:
         raise RuntimeError("Missing GROQ_API_KEY. Set it in the environment or Streamlit secrets.")
-    return ChatGroq(groq_api_key=GROQ_API_KEY, model_name=GROQ_MODEL)
+    return ChatGroq(groq_api_key=GROQ_API_KEY, model_name=model_name)
 
 
 @st.cache_resource(show_spinner=False)
@@ -196,6 +201,41 @@ def summarize_embedding_failure(exc: Exception) -> str:
     if "NOT_FOUND" in message or "404" in message:
         return "Google embedding model is unavailable"
     return "Google embeddings are unavailable right now"
+
+
+def groq_model_candidates() -> list[str]:
+    seen = set()
+    candidates = []
+    for model_name in GROQ_MODEL_CANDIDATES:
+        if model_name and model_name not in seen:
+            seen.add(model_name)
+            candidates.append(model_name)
+    return candidates
+
+
+def invoke_with_groq_fallback(factory):
+    last_error = None
+
+    for model_name in groq_model_candidates():
+        try:
+            llm = build_llm(model_name)
+            result = factory(llm)
+            st.session_state.groq_model = model_name
+            return result
+        except Exception as exc:
+            last_error = exc
+            message = str(exc).lower()
+            if "model_decommissioned" in message or "decommissioned" in message or "not supported" in message:
+                continue
+            if "404" in message and "model" in message:
+                continue
+            raise
+
+    raise RuntimeError(
+        "No working Groq model was available. Tried: "
+        + ", ".join(groq_model_candidates())
+        + f". Last error: {last_error}"
+    )
 
 
 def build_vector_store(all_docs: list[Document], prefer_local: bool = False) -> tuple[FAISS, str]:
@@ -333,6 +373,8 @@ with st.sidebar:
 
     if "embedding_backend" in st.session_state:
         st.caption(f"Embeddings: {st.session_state.embedding_backend}")
+    if "groq_model" in st.session_state:
+        st.caption(f"LLM: {st.session_state.groq_model}")
 
     missing_keys = []
     if not GROQ_API_KEY:
@@ -371,8 +413,11 @@ if uploaded_file and st.button("Summarize Document"):
         st.warning("Embed the document first.")
     else:
         try:
-            summary_chain = create_stuff_documents_chain(build_llm(), summary_prompt)
-            response = summary_chain.invoke({"context": st.session_state.final_docs})
+            response = invoke_with_groq_fallback(
+                lambda llm: create_stuff_documents_chain(llm, summary_prompt).invoke(
+                    {"context": st.session_state.final_docs}
+                )
+            )
             st.subheader("Document Summary")
             if isinstance(response, dict):
                 st.write(response.get("answer", response))
@@ -387,12 +432,15 @@ if prompt1:
         st.warning("Embed the document first.")
     else:
         try:
-            document_chain = create_stuff_documents_chain(build_llm(), qa_prompt)
             retriever = st.session_state.vectors.as_retriever()
-            retrieval_chain = create_retrieval_chain(retriever, document_chain)
 
             start = time.process_time()
-            response = retrieval_chain.invoke({"input": prompt1})
+            response = invoke_with_groq_fallback(
+                lambda llm: create_retrieval_chain(
+                    retriever,
+                    create_stuff_documents_chain(llm, qa_prompt),
+                ).invoke({"input": prompt1})
+            )
             st.write("Response time:", round(time.process_time() - start, 2), "seconds")
 
             st.subheader("Answer")
