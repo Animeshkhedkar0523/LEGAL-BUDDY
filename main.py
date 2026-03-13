@@ -39,6 +39,8 @@ GROQ_MODEL_CANDIDATES = [
 EMBEDDING_MODEL = "gemini-embedding-001"
 PDF_CHUNK_SIZE = 4000
 PDF_CHUNK_OVERLAP = 400
+SUMMARIZE_CHUNK_SIZE = 2000
+SUMMARIZE_CHUNK_OVERLAP = 200
 FREE_TIER_EMBED_ITEM_BUDGET = 95
 LOCAL_EMBEDDING_DIMENSION = 512
 
@@ -52,9 +54,11 @@ nest_asyncio.apply()
 
 def get_config_value(name: str) -> str:
     try:
-        return str(st.secrets[name]).strip()
+        if name in st.secrets:
+            return str(st.secrets[name]).strip()
     except Exception:
-        return os.getenv(name, "").strip()
+        pass
+    return os.getenv(name, "").strip()
 
 
 GROQ_API_KEY = get_config_value("GROQ_API_KEY")
@@ -214,6 +218,12 @@ def groq_model_candidates() -> list[str]:
 
 
 def invoke_with_groq_fallback(factory):
+    if not GROQ_API_KEY:
+        raise RuntimeError(
+            "GROQ_API_KEY is not set. Please set it in Streamlit secrets (.streamlit/secrets.toml) "
+            "or as an environment variable."
+        )
+    
     last_error = None
 
     for model_name in groq_model_candidates():
@@ -356,6 +366,14 @@ def get_top_lawyers(lawyer_rag: list[dict], area: str = "Civil", top_n: int = 3)
     return filtered[:top_n]
 
 
+def limit_docs_for_summarization(docs: list[Document], max_docs: int = 10) -> list[Document]:
+    """Limit number of documents to avoid token limit exceeded errors."""
+    if len(docs) > max_docs:
+        st.info(f"Document has {len(docs)} chunks. Using first {max_docs} for summarization to avoid token limits.")
+        return docs[:max_docs]
+    return docs
+
+
 st.set_page_config(page_title="Legal Document Assistant", layout="wide")
 st.title("Legal Document Q&A Assistant")
 st.markdown("Upload a legal PDF, build embeddings, then summarize or ask questions about it.")
@@ -379,13 +397,14 @@ with st.sidebar:
     missing_keys = []
     if not GROQ_API_KEY:
         missing_keys.append("GROQ_API_KEY")
+    if not GOOGLE_API_KEY:
+        missing_keys.append("GOOGLE_API_KEY")
 
     if missing_keys:
-        st.info("Set these before using summaries and Q&A: " + ", ".join(missing_keys))
-    elif GOOGLE_API_KEY:
-        st.success("API keys detected")
+        st.error("Missing API Keys: " + ", ".join(missing_keys))
+        st.info("Add these to .streamlit/secrets.toml or set as environment variables")
     else:
-        st.info("GROQ key detected. Embeddings will use the built-in local fallback.")
+        st.success("All API keys configured")
 
 uploaded_file = st.file_uploader("Upload a legal document (PDF)", type=["pdf"])
 file_path = None
@@ -413,16 +432,19 @@ if uploaded_file and st.button("Summarize Document"):
         st.warning("Embed the document first.")
     else:
         try:
+            # Limit documents to avoid token limit exceeded
+            limited_docs = limit_docs_for_summarization(st.session_state.final_docs, max_docs=10)
             response = invoke_with_groq_fallback(
                 lambda llm: create_stuff_documents_chain(llm, summary_prompt).invoke(
-                    {"context": st.session_state.final_docs}
+                    {"context": limited_docs}
                 )
             )
             st.subheader("Document Summary")
             if isinstance(response, dict):
-                st.write(response.get("answer", response))
+                summary_text = response.get("output", response.get("answer", str(response)))
             else:
-                st.write(response)
+                summary_text = str(response)
+            st.write(summary_text)
         except Exception as exc:
             st.error(f"Could not summarize the document: {exc}")
 
